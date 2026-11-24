@@ -513,6 +513,8 @@ class Channel():
         Units without the SI prefix (e.g. 'V' for 'mV')
     data_type : list, length: n_records
         How samples are stored: 'int16', 'float32', or None (no samples)
+    calculations : [CalcSetting]
+        Calculation settings stored for the channel (see CalcSetting)
 
     Notes
     ------
@@ -533,6 +535,7 @@ class Channel():
         self.records = records
         self.slot = slot          #LabChart channel slot, 0 based
         self._c = c_index         #index in the C library, -1 = no samples
+        self.calculations = []    #set by File
 
         ptr = h.get()
         self.name = _get_string(lib.adi_slot_name, ptr, slot)
@@ -746,6 +749,172 @@ class Channel():
         else:
             return data
 
+    def get_pyramid(self, record_id: int, first: int | None = None,
+                    sample_range: Sequence[int] | None = None,
+                    time_range: Sequence[float] | None = None,
+                    dtype=np.float32,
+                    scaling: Literal["display", "base", "raw"] = "display",
+                    factor: int = 4, min_level_bins: int = 512,
+                    max_levels: int = 24, target_max_bins: int = 131_072,
+                    n_threads: int | None = None, simd: str | None = None,
+                    progress=None, should_stop=None) -> "Pyramid | None":
+        """
+        Min/max overview ("pyramid") of the channel in one record, for
+        drawing long recordings at any zoom. The samples are decoded and
+        scanned in C and never returned, so no sample array is allocated.
+
+        The finest level holds the minimum and maximum of each run of
+        ``first`` consecutive samples; each coarser level combines
+        ``factor`` bins of the one below, until a level would have fewer
+        than ``min_level_bins`` bins. The last bin of a level may cover
+        fewer samples.
+
+        Parameters
+        ----------
+        record_id : int
+            1 based record.
+        first : int, optional
+            Samples per bin of the finest level. Default
+            max(256, ceil(n / target_max_bins)) for n samples.
+        sample_range : [start, stop], optional
+            1 based, inclusive (as get_data).
+        time_range : [start, stop], optional
+            Seconds (as get_data). Overrides sample_range.
+        dtype, scaling, n_threads, simd :
+            As get_data. The bins equal the min / max of get_data's values;
+            a bin holding a NaN is NaN.
+        factor, min_level_bins, max_levels, target_max_bins :
+            Shape of the pyramid (see above).
+        progress : callable(done_samples, total_samples), optional
+        should_stop : callable() -> bool, optional
+            Checked between pieces of ~4 M samples; True abandons the scan
+            and returns None.
+
+        Returns
+        -------
+        Pyramid, or None if the record has no samples of this channel.
+        """
+        if not 1 <= record_id <= self.n_records:
+            raise ValueError(f"record_id {record_id} out of range [1, {self.n_records}]")
+        n_rec = self.n_samples[record_id - 1]
+        if n_rec == 0:
+            return None
+        start, stop = 1, n_rec
+        if sample_range is not None:
+            start, stop = sample_range
+        if time_range is not None:
+            dt = self.dt[record_id - 1]
+            start, stop = int(time_range[0] / dt) + 1, int(time_range[1] / dt) + 1
+        if start < 1 or stop > n_rec:
+            raise ValueError(f"samples [{start}, {stop}] out of range [1, {n_rec}]")
+        n = stop - start + 1
+        if n <= 0:
+            raise ValueError("# of samples requested is less than 1")
+        if factor < 2:
+            raise ValueError("factor must be at least 2")
+        if first is None:
+            first = max(256, -(-n // int(target_max_bins)))
+        first = int(first)
+        if first <= 0:
+            raise ValueError("first must be positive")
+        dt_out = np.dtype(dtype)
+        if dt_out not in _DTYPES:
+            raise ValueError(f"dtype must be float32, float64 or int16, not {dt_out}")
+        if scaling not in _SCALING:
+            raise ValueError(f"scaling must be 'display', 'base' or 'raw', not {scaling!r}")
+        simd = self.h.simd if simd is None else simd
+        if simd not in _SIMD:
+            raise ValueError(f"simd must be one of {list(_SIMD)}, not {simd!r}")
+        n_threads = self.h.n_threads if n_threads is None else n_threads
+
+        # In pieces of whole bins (~4 M samples) for progress / cancelling;
+        # the bins are the same as from one call
+        nb = -(-n // first)
+        bmin = np.empty(nb, dt_out)
+        bmax = np.empty(nb, dt_out)
+        piece = max(1, 4_000_000 // first) * first
+        done = 0
+        while done < n:
+            if should_stop is not None and should_stop():
+                return None
+            m = min(piece, n - done)
+            b0 = done // first
+            _check(lib.adi_read_minmax(self.h.get(), self._c, record_id - 1,
+                                       start - 1 + done, m, first, _DTYPES[dt_out],
+                                       _SCALING[scaling], n_threads, _SIMD[simd],
+                                       ffi.from_buffer(bmin[b0:]), ffi.from_buffer(bmax[b0:]),
+                                       ffi.NULL))
+            done += m
+            if progress is not None:
+                progress(done, n)
+
+        levels = [PyramidLevel(first, bmin, bmax)]
+        f = first
+        while bmin.size // factor >= min_level_bins and len(levels) < max_levels:
+            bmin = _reduce_bins(bmin, factor, np.minimum)
+            bmax = _reduce_bins(bmax, factor, np.maximum)
+            f *= factor
+            levels.append(PyramidLevel(f, bmin, bmax))
+        return Pyramid(first=first, levels=levels, n_samples=n)
+
+    def __repr__(self):
+        return print_object(self)
+
+
+def _reduce_bins(arr, r, ufunc):
+    """Combine every r adjacent bins with ufunc (np.minimum / np.maximum);
+    a shorter group at the end still makes one bin."""
+    nb = arr.size // r
+    head = ufunc.reduce(arr[:nb * r].reshape(nb, r), axis=1)
+    if nb * r < arr.size:
+        head = np.append(head, ufunc.reduce(arr[nb * r:]))
+    return head
+
+
+@dataclass
+class PyramidLevel:
+    """One level of a Pyramid: the min and max of each bin of ``factor``
+    samples (bin k holds samples k*factor ... (k+1)*factor - 1)."""
+    factor: int
+    bmin: np.ndarray
+    bmax: np.ndarray
+
+    def __repr__(self):
+        return print_object(self)
+
+
+@dataclass
+class Pyramid:
+    """
+    Min/max overview of a channel in one record, finest level first (see
+    Channel.get_pyramid).
+
+    Attributes
+    ----------
+    first : int
+        Samples per bin of the finest level, ``levels[0]``.
+    levels : list of PyramidLevel
+        Finest first; each level's ``factor`` is its samples per bin.
+    n_samples : int
+        Samples summarised.
+    """
+    first: int
+    levels: list
+    n_samples: int
+
+    def extent(self) -> tuple:
+        """(min, max) over all samples, ignoring NaN; (0.0, 0.0) if there is
+        no finite value."""
+        import warnings
+        lv = self.levels[-1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            lo = float(np.nanmin(lv.bmin))
+            hi = float(np.nanmax(lv.bmax))
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return 0.0, 0.0
+        return lo, hi
+
     def __repr__(self):
         return print_object(self)
 
@@ -758,10 +927,11 @@ class RecordTime():
     Attributes
     ----------
     trig_datetime : datetime
-        Local time (as LabChart stores it, without a time zone)
+        Time of the trigger. Local time (as LabChart stores it, without a
+        time zone)
     trig_start_delta : numeric
-        Difference between trigger and data collection start, in ticks.
-        Trigger information isn't read yet, so this is always 0.
+        Difference between trigger and data collection start, in ticks. If
+        positive then data started later; if negative (a pre-trigger), before.
     trig_datestr : string
     rec_datetime : datetime
         Time when the first sample was collected
@@ -771,12 +941,15 @@ class RecordTime():
         UTC minus local time in seconds (nan if not stored). Not in the SDK.
 
     """
-    def __init__(self, tick_dt, start, tz_offset):
+    def __init__(self, tick_dt, start, tz_offset, trig_start_delta=0):
 
-        self.trig_datetime = datetime(1970, 1, 1) + timedelta(seconds=start)
-        self.trig_start_delta = 0
+        # the C library gives the record start; the trigger is delta ticks
+        # before it
+        self.rec_datetime = datetime(1970, 1, 1) + timedelta(seconds=start)
+        self.trig_start_delta = trig_start_delta
+        self.trig_datetime = self.rec_datetime - timedelta(
+            seconds=trig_start_delta * tick_dt)
         self.trig_datestr = self.trig_datetime.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip('0')
-        self.rec_datetime = self.trig_datetime
         self.rec_datestr = self.rec_datetime.strftime("%Y-%m-%d %H:%M:%S.%f").rstrip('0')
         self.tz_offset = tz_offset
 
@@ -808,7 +981,7 @@ class Record():
     record_time : RecordTime
 
     """
-    def __init__(self, h, record_id, slot_to_id):
+    def __init__(self, h, record_id, slot_to_id, all_slots=True):
         """
         Parameters
         ----------
@@ -818,6 +991,9 @@ class Record():
             1 based record
         slot_to_id : dict
             channel slot -> 1 based channel id (for comment channels)
+        all_slots : bool
+            True if channel ids are LabChart's channel numbers (slot + 1),
+            i.e. channels without samples are listed too
         """
         self.h = h
         self.id = record_id
@@ -828,7 +1004,9 @@ class Record():
         tick_dt = ffi.new("double *")
         start = ffi.new("double *")
         tz = ffi.new("double *")
+        trig = ffi.new("int64_t *")
         _check(lib.adi_record_info(ptr, r, n_ticks, tick_dt, start, tz))
+        _check(lib.adi_record_trigger(ptr, r, trig))
         self.n_ticks = int(n_ticks[0])
         self.tick_dt = tick_dt[0]
         self.tick_fs = 1.0/self.tick_dt
@@ -845,17 +1023,107 @@ class Record():
             _check(lib.adi_comment_info(ptr, r, i, cid, chan, tick))
             _check(lib.adi_comment_slot(ptr, r, i, slot))
             text = _get_string(lib.adi_comment_text, ptr, r, i)
-            #1 based channel id, -1 = all channels
-            ch = -1 if slot[0] < 0 else slot_to_id.get(slot[0])
+            # 1 based channel id, -1 = all channels. A comment can belong to
+            # a LabChart channel that is in no record (e.g. a calculated
+            # channel); its id is then LabChart's channel number, as the SDK
+            # reports it (or None when channel ids are renumbered).
+            if slot[0] < 0:
+                ch = -1
+            else:
+                ch = slot_to_id.get(slot[0], slot[0] + 1 if all_slots else None)
             self.comments.append(Comment(text, int(tick[0]), ch, cid[0]))
         for c in self.comments:
             c._add_info(self.id, self.tick_dt)
 
-        self.record_time = RecordTime(self.tick_dt, start[0], tz[0])
+        self.record_time = RecordTime(self.tick_dt, start[0], tz[0], int(trig[0]))
         self.record_time.add_info(self.duration)
 
     def __repr__(self):
         return print_object(self)
+
+
+_CALC_KINDS = {
+    lib.ADI_CALC_OTHER: "other",
+    lib.ADI_CALC_ARITHMETIC: "arithmetic",
+    lib.ADI_CALC_CYCLIC_MEASUREMENTS: "cyclic_measurements",
+    lib.ADI_CALC_DIGITAL_FILTER: "digital_filter",
+    lib.ADI_CALC_SMOOTHING: "smoothing",
+}
+
+
+class CalcSetting():
+
+    """
+    Settings of a channel calculation stored in the file.
+
+    LabChart keeps a channel's calculation settings when the calculation is
+    changed or turned off, so a setting doesn't prove the calculation is in
+    use: a channel can have several, or have samples recorded from an input.
+
+    Attributes
+    ----------
+    channel_number : int
+        LabChart's channel number (1 based)
+    kind : str
+        'arithmetic', 'cyclic_measurements', 'digital_filter', 'smoothing' or
+        'other' (a settings class not identified yet; see class_id)
+    name : str
+        e.g. 'Arithmetic' ('' for 'other')
+    class_id : str
+        GUID of the settings class
+    expression : str or None
+        Arithmetic only, e.g. 'Ch2*Ch3'
+    units : str or None
+        Arithmetic only
+    """
+
+    def __init__(self, channel_number, kind, name, class_id, expression, units):
+        self.channel_number = channel_number
+        self.kind = kind
+        self.name = name
+        self.class_id = class_id
+        self.expression = expression
+        self.units = units
+
+    def __repr__(self):
+        s = f"Ch{self.channel_number}: {self.name or 'class ' + self.class_id}"
+        if self.expression is not None:
+            s += f" {self.expression!r} [{self.units}]"
+        return f"<CalcSetting {s}>"
+
+
+class LabChartChannel():
+
+    """
+    A channel as LabChart numbers it, including calculated channels that have
+    no samples in the file.
+
+    Attributes
+    ----------
+    number : int
+        LabChart's channel number (1 based)
+    name : str
+    channel : Channel or None
+        The File.channels entry for this channel (None if it isn't listed,
+        e.g. a channel without samples after the last channel with samples,
+        or with remove_empty_channels=True)
+    has_samples : bool
+        True if any record stores samples for it
+    calculations : [CalcSetting]
+        Calculation settings stored for the channel (see CalcSetting)
+    """
+
+    def __init__(self, number, name, channel, has_samples, calculations):
+        self.number = number
+        self.name = name
+        self.channel = channel
+        self.has_samples = has_samples
+        self.calculations = calculations
+
+    def __repr__(self):
+        c = ", ".join(x.name or x.class_id for x in self.calculations)
+        return (f"<LabChartChannel {self.number} {self.name!r} "
+                f"samples={self.has_samples} calculations=[{c}]>")
 
 
 class File():
@@ -871,6 +1139,14 @@ class File():
     records
     channels
     channel_names
+    labchart_channels : [LabChartChannel]
+        Every channel LabChart defines, including calculated channels without
+        samples, with the calculation settings stored for each
+    calc_settings : [CalcSetting]
+        All calculation settings, by channel number
+    modules : [str]
+        LabChart modules (extensions) with settings in the file, e.g.
+        'CyclicMeasurements(8)'
 
     Methods
     -------
@@ -906,11 +1182,44 @@ class File():
         self.n_channels = len(slots)
         slot_to_id = {s: k + 1 for k, (s, _) in enumerate(slots)}
 
-        self.records = [Record(self.h, x+1, slot_to_id) for x in range(self.n_records)]
+        self.records = [Record(self.h, x+1, slot_to_id, not remove_empty_channels)
+                        for x in range(self.n_records)]
 
         self.channels = [Channel(self.h, k+1, self.records, self, s, c)
                          for k, (s, c) in enumerate(slots)]
         self.channel_names = [x.name for x in self.channels]
+        self._read_calculations(ptr)
+
+    def _read_calculations(self, ptr):
+        n = ffi.new("int *")
+        kind = ffi.new("int *")
+        _check(lib.adi_n_calc_settings(ptr, n))
+        calcs = []
+        for i in range(n[0]):
+            slot = ffi.new("int *")
+            _check(lib.adi_calc_setting_info(ptr, i, slot, kind))
+            arith = kind[0] == lib.ADI_CALC_ARITHMETIC
+            text = lambda w: _get_string(lib.adi_calc_setting_text, ptr, i, w)
+            calcs.append(CalcSetting(
+                slot[0] + 1, _CALC_KINDS.get(kind[0], "other"),
+                text(lib.ADI_CALC_TEXT_NAME), text(lib.ADI_CALC_TEXT_CLASS),
+                text(lib.ADI_CALC_TEXT_EXPRESSION) if arith else None,
+                text(lib.ADI_CALC_TEXT_UNITS) if arith else None))
+        self.calc_settings = calcs
+
+        _check(lib.adi_n_modules(ptr, n))
+        self.modules = [_get_string(lib.adi_module_name, ptr, i) for i in range(n[0])]
+
+        by_slot = {c.slot: c for c in self.channels}
+        _check(lib.adi_n_labchart_channels(ptr, n))
+        self.labchart_channels = []
+        for s in range(n[0]):
+            _check(lib.adi_slot_channel(ptr, s, kind))
+            self.labchart_channels.append(LabChartChannel(
+                s + 1, _get_string(lib.adi_slot_name, ptr, s), by_slot.get(s),
+                kind[0] >= 0, [c for c in calcs if c.channel_number == s + 1]))
+        for c in self.channels:
+            c.calculations = self.labchart_channels[c.slot].calculations
 
     @overload
     def get_comments(self, return_as: Literal["list"] = ...) -> list[Comment]: ...

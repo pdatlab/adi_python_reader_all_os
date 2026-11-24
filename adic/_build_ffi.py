@@ -44,6 +44,11 @@ _CDEF = r"""
     enum adi_scaling { ADI_SCALE_DISPLAY = 0, ADI_SCALE_BASE = 1, ADI_SCALE_RAW = 2 };
     enum adi_simd { ADI_SIMD_AUTO = 0, ADI_SIMD_NONE = 1, ADI_SIMD_SSE2 = 2, ADI_SIMD_AVX2 = 3 };
     enum adi_data_type { ADI_DATA_NONE = 0, ADI_DATA_INT16 = 1, ADI_DATA_FLOAT32 = 2 };
+    enum adi_calc_kind { ADI_CALC_OTHER = 0, ADI_CALC_ARITHMETIC = 1,
+                         ADI_CALC_CYCLIC_MEASUREMENTS = 2, ADI_CALC_DIGITAL_FILTER = 3,
+                         ADI_CALC_SMOOTHING = 4 };
+    enum adi_calc_text { ADI_CALC_TEXT_NAME = 0, ADI_CALC_TEXT_CLASS = 1,
+                         ADI_CALC_TEXT_EXPRESSION = 2, ADI_CALC_TEXT_UNITS = 3 };
 
     typedef struct adi_file adi_file;
 
@@ -63,11 +68,22 @@ _CDEF = r"""
 
     int adi_record_info(const adi_file *file, int record, int64_t *n_ticks,
                         double *tick_dt, double *start, double *tz_offset);
+    int adi_record_trigger(const adi_file *file, int record,
+                           int64_t *trig_minus_start);
 
     int adi_n_slots(const adi_file *file, int *n_slots);
+    int adi_n_labchart_channels(const adi_file *file, int *n);
     int adi_slot_channel(const adi_file *file, int slot, int *channel);
     int adi_slot_name(const adi_file *file, int slot, char *buf, int buf_len,
                       int *len_needed);
+
+    int adi_n_calc_settings(const adi_file *file, int *n);
+    int adi_calc_setting_info(const adi_file *file, int index, int *slot, int *kind);
+    int adi_calc_setting_text(const adi_file *file, int index, int what, char *buf,
+                              int buf_len, int *len_needed);
+    int adi_n_modules(const adi_file *file, int *n);
+    int adi_module_name(const adi_file *file, int index, char *buf, int buf_len,
+                        int *len_needed);
 
     int adi_channel_name(const adi_file *file, int channel, char *buf,
                          int buf_len, int *len_needed);
@@ -90,9 +106,13 @@ _CDEF = r"""
                          int64_t first_sample, int64_t n_samples,
                          int out_type, int scaling, int n_threads, int simd,
                          void *out, int64_t *n_read);
+    int adi_read_minmax(const adi_file *file, int channel, int record,
+                        int64_t first_sample, int64_t n_samples, int64_t bin_size,
+                        int out_type, int scaling, int n_threads, int simd,
+                        void *mins, void *maxs, int64_t *n_bins);
 """
 
-_LIB_FILES = ["io.c", "cfile.c", "map.c", "decode.c", "decode_sse2.c", "file.c", "read.c"]
+_LIB_FILES = ["io.c", "cfile.c", "map.c", "decode.c", "decode_sse2.c", "file.c", "read.c", "settings.c"]
 
 
 def _is_x64():
